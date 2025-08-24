@@ -1,0 +1,401 @@
+# Install required packages
+!pip install tensorflow opencv-python matplotlib scikit-learn albumentations
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+import cv2
+from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+import albumentations as A
+from glob import glob
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set up GPU if available
+print("GPU Available: ", tf.config.list_physical_devices('GPU'))
+
+# Mount Google Drive (if your data is stored there)
+from google.colab import drive
+drive.mount('/content/drive')
+
+#%% 1. Data Preparation
+base_dir = '/content/drive/MyDrive/liver/data'  # Adjust path
+train_image_dir = os.path.join(base_dir, 'train', 'images')
+train_stenosis_dir = os.path.join(base_dir, 'train', 'stenosis_masks')
+train_tissue_dir = os.path.join(base_dir, 'train', 'tissue_masks')
+
+test_image_dir = os.path.join(base_dir, 'test', 'images')
+test_stenosis_dir = os.path.join(base_dir, 'test', 'stenosis_masks')
+test_tissue_dir = os.path.join(base_dir, 'test', 'tissue_masks')
+
+# Verify paths exist
+assert os.path.exists(train_image_dir), 'Training image directory not found'
+assert os.path.exists(train_stenosis_dir), 'Training stenosis masks directory not found'
+assert os.path.exists(train_tissue_dir), 'Training tissue masks directory not found'
+assert os.path.exists(test_image_dir), 'Test image directory not found'
+assert os.path.exists(test_stenosis_dir), 'Test stenosis masks directory not found'
+assert os.path.exists(test_tissue_dir), 'Test tissue masks directory not found'
+
+# Get file lists
+train_images = sorted(glob(os.path.join(train_image_dir, '*')))
+train_stenosis_masks = sorted(glob(os.path.join(train_stenosis_dir, '*')))
+train_tissue_masks = sorted(glob(os.path.join(train_tissue_dir, '*')))
+
+test_images = sorted(glob(os.path.join(test_image_dir, '*')))
+test_stenosis_masks = sorted(glob(os.path.join(test_stenosis_dir, '*')))
+test_tissue_masks = sorted(glob(os.path.join(test_tissue_dir, '*')))
+
+print(f"Training images: {len(train_images)}")
+print(f"Test images: {len(test_images)}")
+
+#%% 2. Create Combined Masks Function
+def create_combined_mask(tissue_mask_path, stenosis_mask_path):
+    """Combine tissue and stenosis masks: background=0, tissue=1, stenosis=2"""
+    tissue_mask = cv2.imread(tissue_mask_path, cv2.IMREAD_GRAYSCALE)
+    stenosis_mask = cv2.imread(stenosis_mask_path, cv2.IMREAD_GRAYSCALE)
+
+    # Normalize to 0-1
+    tissue_mask = (tissue_mask > 128).astype(np.uint8)
+    stenosis_mask = (stenosis_mask > 128).astype(np.uint8)
+
+    # Combine: tissue=1, stenosis=2 (stenosis takes priority)
+    combined_mask = tissue_mask + stenosis_mask * 2
+    combined_mask = np.clip(combined_mask, 0, 2)
+
+    return combined_mask.astype(np.uint8)
+
+# Create combined training masks
+train_combined_masks = []
+for tissue_path, stenosis_path in zip(train_tissue_masks, train_stenosis_masks):
+    combined = create_combined_mask(tissue_path, stenosis_path)
+    train_combined_masks.append(combined)
+
+# Create combined test masks
+test_combined_masks = []
+for tissue_path, stenosis_path in zip(test_tissue_masks, test_stenosis_masks):
+    combined = create_combined_mask(tissue_path, stenosis_path)
+    test_combined_masks.append(combined)
+
+print(f"Combined masks created - Train: {len(train_combined_masks)}, Test: {len(test_combined_masks)}")
+
+#%% 3. Data Loading and Preprocessing
+INPUT_SIZE = (416, 416)
+NUM_CLASSES = 3
+
+def load_and_preprocess_image(image_path):
+    """Load and preprocess image"""
+    image = cv2.imread(image_path)
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    image = cv2.resize(image, INPUT_SIZE)
+    return image.astype(np.float32) / 255.0
+
+def preprocess_mask(mask):
+    """Preprocess mask"""
+    mask = cv2.resize(mask, INPUT_SIZE, interpolation=cv2.INTER_NEAREST)
+    return mask
+
+# Load training data
+X_train = np.array([load_and_preprocess_image(img_path) for img_path in train_images])
+y_train = np.array([preprocess_mask(mask) for mask in train_combined_masks])
+
+# Load test data
+X_test = np.array([load_and_preprocess_image(img_path) for img_path in test_images])
+y_test = np.array([preprocess_mask(mask) for mask in test_combined_masks])
+
+print(f"Training data shape: {X_train.shape}, {y_train.shape}")
+print(f"Test data shape: {X_test.shape}, {y_test.shape}")
+
+#%% 4. Data Augmentation
+def get_augmentation():
+    """Define augmentation pipeline similar to MATLAB version"""
+    return A.Compose([
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.Rotate(limit=15, p=0.5),
+        A.RandomScale(scale_limit=0.1, p=0.5),
+    ])
+
+augmentation = get_augmentation()
+
+
+def augment_data(images, masks, augmentation):
+    """Apply augmentation to images and masks"""
+    augmented_images = []
+    augmented_masks = []
+
+    for img, mask in zip(images, masks):
+        # Convert to uint8 for albumentations
+        img_uint8 = (img * 255).astype(np.uint8)
+
+        # Ensure mask is uint8
+        mask_uint8 = mask.astype(np.uint8)
+
+        # Apply augmentation
+        augmented = augmentation(image=img_uint8, mask=mask_uint8)
+
+        # Convert back to float32 and ensure consistent shapes
+        aug_img = augmented['image'].astype(np.float32) / 255.0
+        aug_mask = augmented['mask'].astype(np.uint8)
+
+        # Ensure shapes match INPUT_SIZE
+        if aug_img.shape[:2] != INPUT_SIZE:
+            aug_img = cv2.resize(aug_img, INPUT_SIZE)
+        if aug_mask.shape != INPUT_SIZE:
+            aug_mask = cv2.resize(aug_mask, INPUT_SIZE, interpolation=cv2.INTER_NEAREST)
+
+        augmented_images.append(aug_img)
+        augmented_masks.append(aug_mask)
+
+    return np.array(augmented_images), np.array(augmented_masks)
+
+
+
+#%% 5. Apply Data Augmentation
+print("Applying data augmentation...")
+X_aug, y_aug = augment_data(X_train, y_train,augmentation)
+
+# Combine original and augmented data
+X_train_total = np.concatenate([X_train, X_aug])
+y_train_total = np.concatenate([y_train, y_aug])
+
+print(f"Original training data: {X_train.shape}, {y_train.shape}")
+print(f"Augmented data: {X_aug.shape}, {y_aug.shape}")
+print(f"Combined training data: {X_train_total.shape}, {y_train_total.shape}")
+
+# Update training variables
+X_train = X_train_total
+y_train = y_train_total
+
+
+
+# Fixed class weights as requested:
+class_weights = {0: 1.0, 1: 1.0, 2: 1.5}
+print("Class weights set to:", class_weights)
+
+
+#%% 6. U-Net Model Architecture
+def conv_block(inputs, num_filters):
+    """Convolutional block for U-Net"""
+    x = layers.Conv2D(num_filters, 3, padding="same")(inputs)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
+
+    x = layers.Conv2D(num_filters, 3, padding="same")(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
+
+    return x
+
+def encoder_block(inputs, num_filters):
+    """Encoder block for U-Net"""
+    x = conv_block(inputs, num_filters)
+    p = layers.MaxPool2D((2, 2))(x)
+    return x, p
+
+def decoder_block(inputs, skip_features, num_filters):
+    """Decoder block for U-Net"""
+    x = layers.Conv2DTranspose(num_filters, (2, 2), strides=2, padding="same")(inputs)
+    x = layers.Concatenate()([x, skip_features])
+    x = conv_block(x, num_filters)
+    return x
+
+def build_unet(input_shape, num_classes):
+    """Build U-Net model"""
+    inputs = layers.Input(input_shape)
+
+    # Encoder
+    s1, p1 = encoder_block(inputs, 64)
+    s2, p2 = encoder_block(p1, 128)
+    s3, p3 = encoder_block(p2, 256)
+    s4, p4 = encoder_block(p3, 512)
+
+    # Bridge
+    b1 = conv_block(p4, 1024)
+
+    # Decoder
+    d1 = decoder_block(b1, s4, 512)
+    d2 = decoder_block(d1, s3, 256)
+    d3 = decoder_block(d2, s2, 128)
+    d4 = decoder_block(d3, s1, 64)
+
+    # Output
+    outputs = layers.Conv2D(num_classes, 1, padding="same", activation="softmax")(d4)
+
+    model = keras.Model(inputs, outputs, name="U-Net")
+    return model
+
+# Build model
+model = build_unet((INPUT_SIZE[0], INPUT_SIZE[1], 3), NUM_CLASSES)
+model.summary()
+
+
+# Custom weighted categorical crossentropy
+def weighted_categorical_crossentropy(class_weights):
+    """Create weighted categorical crossentropy loss function"""
+    def loss_function(y_true, y_pred):
+        # Convert sparse labels to categorical
+        y_true = tf.cast(y_true, tf.int32)
+        y_true_one_hot = tf.one_hot(y_true, 3)
+
+        # Apply class weights
+        weights = tf.constant(list(class_weights.values()), dtype=tf.float32)
+        weights = tf.gather(weights, y_true)
+
+        # Calculate weighted loss
+        loss = tf.keras.losses.categorical_crossentropy(y_true_one_hot, y_pred)
+        weighted_loss = weights * loss
+
+        return tf.reduce_mean(weighted_loss)
+
+    return loss_function
+
+# Compile model (keep this as is)
+model.compile(
+    optimizer=keras.optimizers.Adam(learning_rate=1e-3),
+    loss=weighted_categorical_crossentropy(class_weights),  # Class weights already applied here
+    metrics=['accuracy', 'sparse_categorical_accuracy']
+)
+
+# Callbacks (keep this as is)
+callbacks = [
+    keras.callbacks.ModelCheckpoint(
+        'best_model.h5', save_best_only=True, monitor='val_loss', mode='min'
+    ),
+    keras.callbacks.ReduceLROnPlateau(
+        monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6
+    )
+
+]
+
+# Train model (REMOVE the class_weight parameter)
+history = model.fit(
+    X_train, y_train,
+    validation_data=(X_test, y_test),
+    epochs=40,
+    batch_size=16,
+    # class_weight=class_weights,  # REMOVE THIS LINE - it causes the error
+    callbacks=callbacks,
+    verbose=1
+)
+
+
+#%% 8. Plot Training History
+plt.figure(figsize=(12, 4))
+
+plt.subplot(1, 2, 1)
+plt.plot(history.history['accuracy'], label='Training Accuracy')
+plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
+plt.title('Model Accuracy')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.legend()
+
+plt.subplot(1, 2, 2)
+plt.plot(history.history['loss'], label='Training Loss')
+plt.plot(history.history['val_loss'], label='Validation Loss')
+plt.title('Model Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+
+plt.tight_layout()
+plt.show()
+
+#%% 9. Evaluation and Metrics
+def calculate_iou(y_true, y_pred, num_classes):
+    """Calculate Intersection over Union for each class"""
+    ious = []
+    for class_idx in range(num_classes):
+        true_class = (y_true == class_idx)
+        pred_class = (y_pred == class_idx)
+
+        intersection = np.logical_and(true_class, pred_class).sum()
+        union = np.logical_or(true_class, pred_class).sum()
+
+        if union == 0:
+            iou = 1.0 if intersection == 0 else 0.0
+        else:
+            iou = intersection / union
+
+        ious.append(iou)
+
+    return ious
+
+# Make predictions
+y_pred = model.predict(X_test)
+y_pred_classes = np.argmax(y_pred, axis=-1)
+
+# Calculate metrics
+class_names = ['Background', 'Tissue', 'Stenosis']
+ious = []
+
+for i in range(len(X_test)):
+    iou = calculate_iou(y_test[i], y_pred_classes[i], NUM_CLASSES)
+    ious.append(iou)
+
+mean_ious = np.mean(ious, axis=0)
+
+print("\nEvaluation Metrics:")
+print("-" * 40)
+for i, (class_name, miou) in enumerate(zip(class_names, mean_ious)):
+    print(f"{class_name}: IoU = {miou:.4f}")
+print(f"Mean IoU: {np.mean(mean_ious):.4f}")
+
+# Overall accuracy
+accuracy = np.mean(y_test == y_pred_classes)
+print(f"Overall Accuracy: {accuracy:.4f}")
+
+#%% 10. Visualization
+def visualize_results(images, true_masks, pred_masks, indices=[0, 1, 2]):
+    """Visualize segmentation results"""
+    fig, axes = plt.subplots(len(indices), 3, figsize=(12, 4*len(indices)))
+
+    cmap_colors = ['black', 'green', 'red']
+
+    for idx, img_idx in enumerate(indices):
+        if len(indices) == 1:
+            ax_row = axes
+        else:
+            ax_row = axes[idx]
+
+        # Original image
+        ax_row[0].imshow(images[img_idx])
+        ax_row[0].set_title(f'Original Image {img_idx+1}')
+        ax_row[0].axis('off')
+
+        # Ground truth
+        ax_row[1].imshow(images[img_idx])
+        ax_row[1].imshow(true_masks[img_idx], alpha=0.6, cmap='viridis')
+        ax_row[1].set_title(f'Ground Truth {img_idx+1}')
+        ax_row[1].axis('off')
+
+        # Prediction
+        ax_row[2].imshow(images[img_idx])
+        ax_row[2].imshow(pred_masks[img_idx], alpha=0.6, cmap='viridis')
+        ax_row[2].set_title(f'Prediction {img_idx+1}')
+        ax_row[2].axis('off')
+
+    plt.tight_layout()
+    plt.show()
+
+# Visualize test results
+visualize_results(X_test, y_test, y_pred_classes, indices=[0, 1, 2])
+
+# Visualize training results
+y_train_pred = model.predict(X_train[:3])
+y_train_pred_classes = np.argmax(y_train_pred, axis=-1)
+visualize_results(X_train[:3], y_train[:3], y_train_pred_classes, indices=[0, 1, 2])
+
+#%% 11. Save Model
+model.save('multiclass_stenosis_unet.h5')
+print("Model saved successfully!")
+
+# Save model summary
+with open('model_summary.txt', 'w') as f:
+    model.summary(print_fn=lambda x: f.write(x + '\n'))
+
+print("Conversion completed successfully!")
